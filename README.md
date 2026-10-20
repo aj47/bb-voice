@@ -9,7 +9,7 @@ Open a thread, tap the waveform button next to the composer's mic, and talk. You
 
 | Thread with the realtime button | Live session | Voice settings |
 | --- | --- | --- |
-| ![Thread](docs/screenshots/thread.png) | ![Live session](docs/screenshots/live.png) | ![Settings](docs/screenshots/settings.png) |
+| <img src="docs/screenshots/thread.png" width="240" alt="Thread with the realtime button"> | <img src="docs/screenshots/live.png" width="240" alt="Live session"> | <img src="docs/screenshots/settings.png" width="240" alt="Voice settings"> |
 
 ## Setup
 
