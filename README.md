@@ -11,6 +11,15 @@ Open a thread, tap the waveform button next to the composer's mic, and talk. You
 | --- | --- | --- |
 | <img src="docs/screenshots/thread.png" width="240" alt="Thread with the realtime button"> | <img src="docs/screenshots/live.png" width="240" alt="Live session"> | <img src="docs/screenshots/settings.png" width="240" alt="Voice settings"> |
 
+## Download
+
+Prebuilt files are attached to each [GitHub release](https://github.com/aj47/bb-voice/releases):
+
+- `bb-voice.apk` for Android. Install it directly; you may need to allow installs from your browser or file manager.
+- `bb-voice-unsigned.ipa` for iOS. Install it with [Sideloadly](https://sideloadly.io) or [AltStore](https://altstore.io), which sign it with your Apple ID. With a free Apple ID the app has to be re-installed every 7 days. iOS is untested and only works while the app is open.
+
+You still need steps 1 and 2 below on the machine running bb.
+
 ## Setup
 
 You need a running bb, and the phone needs to reach it. Tailscale is the easiest way. bb's API has no token auth, so keep it on a private network.
