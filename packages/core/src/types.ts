@@ -9,6 +9,7 @@ export type VoiceSnapshot = {
   partial: string;
   log: LogEntry[];
   error: string | null;
+  micMuted: boolean;
 };
 
 // Common surface for the classic (STT + TTS) and live (OpenAI GPT-Live) engines.
@@ -17,7 +18,11 @@ export interface VoiceEngine {
   start(): Promise<void>;
   stop(): void;
   interrupt(): boolean;
+  // Stop hearing the user without ending the session; replies still play.
+  setMicMuted(muted: boolean): void;
 }
+
+export const MUTED_NOTIFICATION = 'Mic muted';
 
 export const PHASE_NOTIFICATION: Record<Phase, string> = {
   off: 'Off',

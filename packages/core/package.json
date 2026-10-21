@@ -1,6 +1,6 @@
 {
   "name": "@aj47/bb-voice-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Voice engines for bb: the on-device and GPT-Live loops shared by the bb voice app and the handsfree bb plugin.",
   "license": "MIT",
   "type": "module",

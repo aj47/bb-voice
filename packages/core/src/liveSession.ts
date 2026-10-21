@@ -15,8 +15,8 @@
 // to OpenAI with the key it holds, the desktop plugin relays it through its
 // server so the key never reaches the page.
 
-import { BbClient, threadLabel, type BbEvent, type BbThread } from './bb';
-import { PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
+import { BbClient, threadLabel, type BbEvent, type BbThread, type TranscriptEntry } from './bb';
+import { MUTED_NOTIFICATION, PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
 
 export type LiveSettings = { model: string; voice: string; delegateModel: string };
 
@@ -33,7 +33,7 @@ export type PeerConnection = {
   close(): void;
 };
 
-export type AudioStream = { getTracks(): { stop(): void }[] };
+export type AudioStream = { getTracks(): { stop(): void; enabled: boolean }[] };
 
 export type LivePlatform = {
   createPeerConnection(): PeerConnection;
@@ -197,7 +197,7 @@ type Tracker = {
 type ToolCall = { call_id: string; name: string; arguments: string };
 
 export class LiveSession implements VoiceEngine {
-  private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null };
+  private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null, micMuted: false };
   private listeners = new Set<(s: VoiceSnapshot) => void>();
   private pc: PeerConnection | null = null;
   private dc: any = null;
@@ -219,6 +219,11 @@ export class LiveSession implements VoiceEngine {
   private seenCalls = new Set<string>();
   private toolFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private toolsRunning = false;
+
+  // Spoken turns waiting for a thread (a session started from the home page),
+  // and the chain that keeps appends to bb in order.
+  private unfiledTranscript: TranscriptEntry[] = [];
+  private transcriptWrites: Promise<void> = Promise.resolve();
 
   constructor(
     private platform: LivePlatform,
@@ -255,6 +260,8 @@ export class LiveSession implements VoiceEngine {
 
   stop() {
     if (!this.enabled && !this.pc) return;
+    this.commitUserLine();
+    this.commitAssistantLine();
     this.enabled = false;
     this.send({ type: 'session.close' });
     if (this.ticker) clearInterval(this.ticker);
@@ -277,7 +284,15 @@ export class LiveSession implements VoiceEngine {
     this.platform.setAudioRoute?.(false);
     this.platform.keepAlive.stop();
     this.started = false;
-    this.update({ phase: 'off', partial: '' });
+    this.update({ phase: 'off', partial: '', micMuted: false });
+  }
+
+  // Disabled tracks send silence, so the connection and the voice's replies carry on.
+  setMicMuted(muted: boolean) {
+    if (muted === this.snapshot.micMuted) return;
+    this.stream?.getTracks().forEach((t) => (t.enabled = !muted));
+    this.update({ micMuted: muted });
+    this.platform.keepAlive.update(this.threadTitle, muted ? `Live · ${MUTED_NOTIFICATION}` : `Live · ${PHASE_NOTIFICATION[this.snapshot.phase]}`);
   }
 
   interrupt() {
@@ -331,7 +346,10 @@ export class LiveSession implements VoiceEngine {
 
     const stream = await this.platform.getUserMedia();
     this.stream = stream;
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    stream.getTracks().forEach((track) => {
+      track.enabled = !this.snapshot.micMuted;
+      pc.addTrack(track, stream);
+    });
     this.platform.setAudioRoute?.(true);
 
     const dc = pc.createDataChannel('oai-events');
@@ -374,6 +392,7 @@ export class LiveSession implements VoiceEngine {
         this.update({ partial: this.userLine.trim() });
         break;
       case 'session.output_transcript.delta':
+        this.commitUserLine();
         this.assistantLine += ev.delta ?? '';
         this.lastOutputAt = Date.now();
         break;
@@ -465,7 +484,7 @@ export class LiveSession implements VoiceEngine {
         tracker.awaitingReply = true;
         tracker.turnActive = true;
         tracker.turnText = [];
-        this.log('you', message);
+        this.log('system', `To agent: ${message}`);
         return {
           status: res.delivery === 'queued' ? 'queued behind the agent\'s current work' : 'sent; the agent is working',
           thread: tracker.title,
@@ -500,7 +519,7 @@ export class LiveSession implements VoiceEngine {
         const tracker = await this.track(thread.id, threadLabel(thread));
         tracker.awaitingReply = true;
         tracker.turnActive = true;
-        this.log('you', message);
+        this.log('system', `To agent: ${message}`);
         return { created: threadLabel(thread), id: thread.id, note: 'The agent is starting; its reply will arrive later.' };
       }
       case 'read_thread': {
@@ -537,6 +556,7 @@ export class LiveSession implements VoiceEngine {
   }
 
   private async setCurrent(thread: BbThread) {
+    if (!this.threadId && this.unfiledTranscript.length) this.writeTranscript(thread.id, this.unfiledTranscript.splice(0));
     this.threadId = thread.id;
     this.threadTitle = threadLabel(thread);
     await this.track(thread.id, this.threadTitle);
@@ -618,15 +638,40 @@ export class LiveSession implements VoiceEngine {
 
   private tick() {
     const now = Date.now();
-    if (this.assistantLine.trim() && now - this.lastOutputAt > SPEAKING_DECAY_MS) {
-      this.log('assistant', this.assistantLine.trim());
-      this.assistantLine = '';
-    }
-    if (this.userLine.trim() && now - this.lastUserDeltaAt > HEARING_DECAY_MS * 2) {
-      this.userLine = '';
-      this.update({ partial: '' });
-    }
+    if (this.userLine.trim() && now - this.lastUserDeltaAt > HEARING_DECAY_MS * 2) this.commitUserLine();
+    if (this.assistantLine.trim() && now - this.lastOutputAt > SPEAKING_DECAY_MS) this.commitAssistantLine();
     this.refreshPhase();
+  }
+
+  private commitUserLine() {
+    const text = this.userLine.trim();
+    this.userLine = '';
+    if (!text) return;
+    this.update({ partial: '' });
+    this.log('you', text);
+    this.recordTranscript('user', text);
+  }
+
+  private commitAssistantLine() {
+    const text = this.assistantLine.trim();
+    this.assistantLine = '';
+    if (!text) return;
+    this.log('assistant', text);
+    this.recordTranscript('assistant', text);
+  }
+
+  // ---- transcript -------------------------------------------------------------
+
+  private recordTranscript(role: TranscriptEntry['role'], text: string) {
+    const entry = { role, text, at: Date.now() };
+    if (this.threadId) this.writeTranscript(this.threadId, [entry]);
+    else this.unfiledTranscript.push(entry);
+  }
+
+  private writeTranscript(threadId: string, entries: TranscriptEntry[]) {
+    this.transcriptWrites = this.transcriptWrites
+      .then(() => this.client.appendTranscript(threadId, entries))
+      .catch((e) => debug('transcript', e?.message ?? e));
   }
 
   private refreshPhase() {
@@ -642,7 +687,7 @@ export class LiveSession implements VoiceEngine {
             ? 'thinking'
             : 'listening';
     if (phase !== this.snapshot.phase) {
-      this.platform.keepAlive.update(this.threadTitle, `Live · ${PHASE_NOTIFICATION[phase]}`);
+      if (!this.snapshot.micMuted) this.platform.keepAlive.update(this.threadTitle, `Live · ${PHASE_NOTIFICATION[phase]}`);
       this.update({ phase, error: null });
     }
   }

@@ -5,6 +5,7 @@
 // to this shell over the WebView bridge: the page posts `bbvoice.toggle`, the
 // shell answers by dispatching `bbvoice:state` into the page.
 
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -119,9 +120,16 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   useEffect(() => {
     if (loadError) return;
     loaded.current = false;
-    const timer = setTimeout(() => {
-      if (!loaded.current) setLoadError(`Couldn't reach ${server} (timed out). Is it running and reachable from this phone?`);
-    }, LOAD_TIMEOUT_MS);
+    // A backgrounded or locked app can't finish loading; only time the foreground.
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      timer = setTimeout(() => {
+        if (loaded.current) return;
+        if (AppState.currentState !== 'active') return arm();
+        setLoadError(`Couldn't reach ${server} (timed out). Is it running and reachable from this phone?`);
+      }, LOAD_TIMEOUT_MS);
+    };
+    arm();
     return () => clearTimeout(timer);
   }, [loadError, server]);
 
@@ -280,6 +288,8 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
           phase={phase}
           partial={snap.partial}
           error={snap.error}
+          micMuted={snap.micMuted}
+          onToggleMic={() => active.current?.session.setMicMuted(!snap.micMuted)}
           onPress={() => {
             const s = active.current?.session;
             if (!s) return;
@@ -425,6 +435,9 @@ const PHASE_LABEL: Record<Phase, string> = {
   error: 'Error · tap to retry',
 };
 
+const MUTED_COLOR = '#4a4a4a';
+const MUTED_ACCENT = '#d64545';
+
 const PHASE_COLOR: Record<Phase, string> = {
   off: '#3a3a3a',
   listening: '#1f7a4d',
@@ -439,14 +452,19 @@ function VoiceBar(props: {
   phase: Phase;
   partial: string;
   error: string | null;
+  micMuted: boolean;
+  onToggleMic: () => void;
   onPress: () => void;
   onStop: () => void;
 }) {
+  // Muted while it would be listening: say so instead of "Listening".
+  const waiting = props.phase === 'listening' || props.phase === 'hearing';
+  const label = props.micMuted ? (waiting ? 'Mic muted' : `${PHASE_LABEL[props.phase]} · mic muted`) : PHASE_LABEL[props.phase];
   return (
-    <View style={[styles.bar, { backgroundColor: PHASE_COLOR[props.phase] }]}>
+    <View style={[styles.bar, { backgroundColor: props.micMuted && waiting ? MUTED_COLOR : PHASE_COLOR[props.phase] }]}>
       <Pressable style={styles.barMain} onPress={props.onPress}>
         <Text style={styles.barPhase} numberOfLines={1}>
-          {PHASE_LABEL[props.phase]} · {props.title}
+          {label} · {props.title}
         </Text>
         {props.error || props.partial ? (
           <Text style={styles.barSub} numberOfLines={2}>
@@ -454,6 +472,18 @@ function VoiceBar(props: {
           </Text>
         ) : null}
       </Pressable>
+      {props.phase !== 'off' && props.phase !== 'error' ? (
+        <Pressable
+          style={[styles.barMic, props.micMuted && styles.barMicMuted]}
+          onPress={props.onToggleMic}
+          hitSlop={8}
+          accessibilityRole="switch"
+          accessibilityState={{ checked: props.micMuted }}
+          accessibilityLabel={props.micMuted ? 'Unmute microphone' : 'Mute microphone'}
+        >
+          <MaterialCommunityIcons name={props.micMuted ? 'microphone-off' : 'microphone'} size={20} color="#fff" />
+        </Pressable>
+      ) : null}
       <Pressable style={styles.barStop} onPress={props.onStop} hitSlop={10} accessibilityLabel="Stop hands-free">
         <Text style={styles.barStopText}>✕</Text>
       </Pressable>
@@ -477,6 +507,8 @@ const styles = StyleSheet.create({
   barSub: { color: '#ffffffcc', fontSize: 13, marginTop: 2, fontStyle: 'italic' },
   barStop: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#00000033', alignItems: 'center', justifyContent: 'center' },
   barStopText: { color: '#fff', fontSize: 16 },
+  barMic: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#00000033', alignItems: 'center', justifyContent: 'center' },
+  barMicMuted: { backgroundColor: MUTED_ACCENT },
   sheetBackdrop: { flex: 1, backgroundColor: '#0008' },
   sheet: { backgroundColor: '#181818', padding: 20, paddingBottom: 36, gap: 10, borderTopLeftRadius: 16, borderTopRightRadius: 16 },
   label: { color: '#aaa', fontSize: 13, marginTop: 4 },

@@ -10,7 +10,7 @@
 
 import { BbClient, threadLabel, type BbEvent } from './bb';
 import { SentenceChunker } from './speakable';
-import { PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
+import { MUTED_NOTIFICATION, PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
 
 export type VoiceSettings = {
   language: string;
@@ -55,7 +55,7 @@ const STOP_WORDS = new Set(['stop', 'cancel', 'stop stop', 'stop it', 'never min
 const BENIGN_ERRORS = new Set(['no-speech', 'aborted', 'speech-timeout', 'busy', 'client']);
 
 export class ClassicSession implements VoiceEngine {
-  private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null };
+  private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null, micMuted: false };
   private listeners = new Set<(s: VoiceSnapshot) => void>();
   private unlisten: (() => void) | null = null;
   private unwatch: (() => void) | null = null;
@@ -140,7 +140,24 @@ export class ClassicSession implements VoiceEngine {
     this.platform.speaker.stop();
     this.speechQueued = 0;
     this.platform.keepAlive.stop();
-    this.update({ phase: 'off', partial: '' });
+    this.update({ phase: 'off', partial: '', micMuted: false });
+  }
+
+  // Muting keeps what was already heard: it still sends after the usual pause.
+  setMicMuted(muted: boolean) {
+    if (muted === this.snapshot.micMuted) return;
+    this.update({ micMuted: muted });
+    if (muted) {
+      if (this.lastPartial) {
+        this.pending.push(this.lastPartial);
+        if (!this.sendTimer) this.scheduleSend();
+      }
+      this.pauseMic();
+      this.platform.keepAlive.update(this.title, MUTED_NOTIFICATION);
+    } else {
+      this.platform.keepAlive.update(this.title, PHASE_NOTIFICATION[this.snapshot.phase]);
+      this.listen();
+    }
   }
 
   // Tap while speaking: shut up and listen. Tap otherwise: toggle on/off.
@@ -211,7 +228,7 @@ export class ClassicSession implements VoiceEngine {
   }
 
   private canListen() {
-    return this.enabled && this.speechQueued === 0;
+    return this.enabled && this.speechQueued === 0 && !this.snapshot.micMuted;
   }
 
   private listen() {
@@ -407,7 +424,7 @@ export class ClassicSession implements VoiceEngine {
     if (!this.enabled) return;
     const phase: Phase =
       this.speechQueued > 0 ? 'speaking' : this.turnActive ? 'thinking' : 'listening';
-    if (phase !== this.snapshot.phase) this.platform.keepAlive.update(this.title, PHASE_NOTIFICATION[phase]);
+    if (phase !== this.snapshot.phase && !this.snapshot.micMuted) this.platform.keepAlive.update(this.title, PHASE_NOTIFICATION[phase]);
     if (phase !== this.snapshot.phase || this.snapshot.error) this.update({ phase, error: null });
   }
 

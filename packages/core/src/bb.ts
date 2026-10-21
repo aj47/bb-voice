@@ -18,7 +18,12 @@ export type BbEvent = {
   data: any;
 };
 
+// One spoken turn of a GPT-Live conversation, shown in its thread by the
+// handsfree bb plugin (bb's timeline only holds agent turns).
+export type TranscriptEntry = { role: 'user' | 'assistant'; text: string; at: number };
+
 const EVENT_PAGE = 100;
+const TRANSCRIPT_RPC = '/plugins/handsfree/rpc/transcript.append';
 
 export class BbClient {
   constructor(public readonly baseUrl: string) {}
@@ -101,6 +106,14 @@ export class BbClient {
         environment: { type: 'project-default' },
       }),
     });
+  }
+
+  async appendTranscript(threadId: string, entries: TranscriptEntry[]) {
+    const res = await this.json<{ ok: boolean; error?: { message?: string } }>(TRANSCRIPT_RPC, {
+      method: 'POST',
+      body: JSON.stringify({ threadId, entries }),
+    });
+    if (!res?.ok) throw new Error(res?.error?.message ?? 'transcript.append failed');
   }
 
   // The latest agent messages in a thread, oldest first.
