@@ -1,7 +1,7 @@
 // bb voice: the bb web UI in a WebView, plus a native hands-free voice loop
 // that keeps working with the screen off or locked.
 //
-// The `handsfree` bb plugin adds a mic button to each thread header. It talks
+// The `handsfree` bb plugin adds a realtime button to each thread composer. It talks
 // to this shell over the WebView bridge: the page posts `bbvoice.toggle`, the
 // shell answers by dispatching `bbvoice:state` into the page.
 
@@ -10,11 +10,26 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState, BackHandler, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
+import {
+  BbClient,
+  BRIDGE_VERSION,
+  ClassicSession,
+  DEFAULT_SETTINGS,
+  LIVE_VOICES,
+  LiveSession,
+  parseBridgeMessage,
+  STATE_EVENT,
+  threadLabel,
+  type BridgeState,
+  type Phase,
+  type VoiceEngine,
+  type VoiceMode,
+  type VoicePrefs,
+  type VoiceSnapshot,
+} from '@aj47/bb-voice-core';
 import { onStopRequested } from './modules/bb-voice-native/src';
-import { BbClient, threadLabel } from './src/bb';
-import { LiveSession } from './src/liveSession';
-import { DEFAULT_APP_SETTINGS, getApiKey, loadSettings, saveSettings, type AppSettings, type VoiceMode } from './src/settings';
-import { DEFAULT_SETTINGS, VoiceSession, type Phase, type VoiceEngine, type VoiceSnapshot } from './src/voiceSession';
+import { classicPlatform, livePlatform } from './src/platform';
+import { DEFAULT_APP_SETTINGS, getApiKey, loadSettings, saveSettings, type AppSettings } from './src/settings';
 
 const KEY_SERVER = 'bbvoice.server';
 
@@ -70,7 +85,7 @@ function ServerSetup({ initial, onSave, error }: { initial: string; onSave: (url
 }
 
 const BRIDGE_BOOT = `
-  window.__BB_VOICE__ = { version: 1, state: null };
+  window.__BB_VOICE__ = { version: ${BRIDGE_VERSION}, state: null };
   true;
 `;
 
@@ -95,11 +110,11 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
 
   // Push the voice state into the page so the plugin button reflects it.
   const publish = useCallback((phase: Phase) => {
-    const state = active.current ? { threadId: active.current.threadId, phase, mode: active.current.mode } : null;
+    const state: BridgeState | null = active.current ? { threadId: active.current.threadId, phase, mode: active.current.mode } : null;
     web.current?.injectJavaScript(`
       if (window.__BB_VOICE__) {
         window.__BB_VOICE__.state = ${JSON.stringify(state)};
-        window.dispatchEvent(new CustomEvent('bbvoice:state'));
+        window.dispatchEvent(new CustomEvent('${STATE_EVENT}'));
       }
       true;
     `);
@@ -130,10 +145,11 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
           return;
         }
         session = new LiveSession(
+          livePlatform(apiKey),
           client,
           threadId,
           title,
-          { apiKey, model: current.liveModel, voice: current.liveVoice, delegateModel: current.delegateModel },
+          { model: current.liveModel, voice: current.liveVoice, delegateModel: current.delegateModel },
           // The voice can move itself to another thread (switch_thread / new_thread).
           (nextId, nextTitle) => {
             if (active.current?.session !== session) return;
@@ -143,7 +159,7 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
           },
         );
       } else {
-        session = new VoiceSession(client, threadId, DEFAULT_SETTINGS, title);
+        session = new ClassicSession(classicPlatform, client, threadId, DEFAULT_SETTINGS, title);
       }
       active.current = { threadId, title, mode: current.mode, session };
       setActiveTitle(title);
@@ -186,11 +202,9 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
 
   const onMessage = useCallback(
     (e: WebViewMessageEvent) => {
-      try {
-        const msg = JSON.parse(e.nativeEvent.data);
-        if (msg?.type === 'bbvoice.toggle' && typeof msg.threadId === 'string') toggle(msg.threadId);
-        if (msg?.type === 'bbvoice.settings') setShowSettings(true);
-      } catch {}
+      const msg = parseBridgeMessage(e.nativeEvent.data);
+      if (msg?.type === 'bbvoice.toggle') toggle(msg.threadId);
+      if (msg?.type === 'bbvoice.settings') setShowSettings(true);
     },
     [toggle],
   );
@@ -260,13 +274,6 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   );
 }
 
-// GPT-Live voices from OpenAI's docs; marin and cedar are the recommended defaults.
-const LIVE_VOICES = [
-  'marin', 'cedar', 'quartz', 'ripple', 'vesper', 'willow', 'stone', 'gleam', 'meridian', 'bossa', 'tempo',
-  'beacon', 'delta', 'cinder', 'nuri', 'juni', 'flitz', 'brise', 'sillage', 'nira', 'harema', 'shida', 'noeul',
-  'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse',
-];
-
 function Dropdown({ value, options, onChange }: { value: string; options: string[]; onChange: (v: string) => void }) {
   const [open, setOpen] = useState(false);
   return (
@@ -299,7 +306,7 @@ function SettingsSheet(props: {
   visible: boolean;
   settings: AppSettings;
   onClose: () => void;
-  onSave: (next: Omit<AppSettings, 'hasApiKey'>, apiKey?: string) => void;
+  onSave: (next: VoicePrefs, apiKey?: string) => void;
 }) {
   const [mode, setMode] = useState<VoiceMode>(props.settings.mode);
   const [model, setModel] = useState(props.settings.liveModel);

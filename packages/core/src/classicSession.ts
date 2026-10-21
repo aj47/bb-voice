@@ -8,39 +8,9 @@
 //   any new speech holds the pending send.
 // - Half duplex: stop the mic while TTS plays so the agent never hears itself.
 
-import * as Speech from 'expo-speech';
-import { ExpoSpeechRecognitionModule } from 'expo-speech-recognition';
-import { startKeepAlive, stopKeepAlive, updateKeepAlive } from '../modules/bb-voice-native/src';
 import { BbClient, type BbEvent } from './bb';
 import { SentenceChunker } from './speakable';
-
-export type Phase = 'off' | 'listening' | 'hearing' | 'thinking' | 'speaking' | 'error';
-
-export type LogEntry = { id: number; role: 'you' | 'agent' | 'assistant' | 'system'; text: string };
-
-// Common surface for the classic (on-device STT + TTS) and live (OpenAI Realtime) engines.
-export interface VoiceEngine {
-  subscribe(fn: (s: VoiceSnapshot) => void): () => void;
-  start(): Promise<void>;
-  stop(): void;
-  interrupt(): boolean;
-}
-
-export const PHASE_NOTIFICATION: Record<Phase, string> = {
-  off: 'Off',
-  listening: 'Listening',
-  hearing: 'Hearing you',
-  thinking: 'Agent working',
-  speaking: 'Speaking',
-  error: 'Error',
-};
-
-export type VoiceSnapshot = {
-  phase: Phase;
-  partial: string;
-  log: LogEntry[];
-  error: string | null;
-};
+import { PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
 
 export type VoiceSettings = {
   language: string;
@@ -48,15 +18,39 @@ export type VoiceSettings = {
   debounceMs: number;
 };
 
+// Speech recognition, modelled on expo-speech-recognition: each `start` is one
+// short session that ends with `end`. `speech` is optional, for recognizers
+// without partial transcripts (it marks voice activity).
+export type RecognizerEvents = {
+  result(transcript: string, isFinal: boolean): void;
+  end(): void;
+  error(code: string, message?: string): void;
+  speech?(): void;
+};
+
+export interface Recognizer {
+  requestPermission(): Promise<boolean>;
+  listen(events: RecognizerEvents): () => void;
+  start(language: string): void;
+  abort(): void;
+}
+
+export interface Speaker {
+  speak(text: string, options: { language: string; rate: number; onDone: () => void }): void;
+  stop(): void;
+}
+
+export type ClassicPlatform = { recognizer: Recognizer; speaker: Speaker; keepAlive: KeepAlive };
+
 const LOG_LIMIT = 60;
 const debug = (...args: unknown[]) => console.log('[bbvoice]', ...args);
 const STOP_WORDS = new Set(['stop', 'cancel', 'stop stop', 'stop it', 'never mind', 'nevermind']);
 const BENIGN_ERRORS = new Set(['no-speech', 'aborted', 'speech-timeout', 'busy', 'client']);
 
-export class VoiceSession implements VoiceEngine {
+export class ClassicSession implements VoiceEngine {
   private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null };
   private listeners = new Set<(s: VoiceSnapshot) => void>();
-  private subs: { remove(): void }[] = [];
+  private unlisten: (() => void) | null = null;
   private unwatch: (() => void) | null = null;
 
   private enabled = false;
@@ -84,6 +78,7 @@ export class VoiceSession implements VoiceEngine {
   private nextLogId = 1;
 
   constructor(
+    private platform: ClassicPlatform,
     private client: BbClient,
     private threadId: string,
     private settings: VoiceSettings,
@@ -98,14 +93,13 @@ export class VoiceSession implements VoiceEngine {
 
   async start() {
     if (this.enabled) return;
-    const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-    if (!perm.granted) {
+    if (!(await this.platform.recognizer.requestPermission())) {
       this.update({ phase: 'error', error: 'Microphone permission denied' });
       return;
     }
     this.enabled = true;
     this.errorStreak = 0;
-    await startKeepAlive(this.title, 'Listening');
+    await this.platform.keepAlive.start(this.title, 'Listening');
     this.bindRecognizer();
 
     try {
@@ -126,15 +120,15 @@ export class VoiceSession implements VoiceEngine {
     this.pending = [];
     this.unwatch?.();
     this.unwatch = null;
-    this.subs.forEach((s) => s.remove());
-    this.subs = [];
+    this.unlisten?.();
+    this.unlisten = null;
     try {
-      ExpoSpeechRecognitionModule.abort();
+      this.platform.recognizer.abort();
     } catch {}
     this.recognizing = false;
-    Speech.stop();
+    this.platform.speaker.stop();
     this.speechQueued = 0;
-    stopKeepAlive();
+    this.platform.keepAlive.stop();
     this.update({ phase: 'off', partial: '' });
   }
 
@@ -143,7 +137,7 @@ export class VoiceSession implements VoiceEngine {
     if (this.speechQueued > 0) {
       this.muted = this.turnActive;
       this.speechQueued = 0;
-      Speech.stop();
+      this.platform.speaker.stop();
       this.refreshPhase();
       this.listen();
       return true;
@@ -154,17 +148,15 @@ export class VoiceSession implements VoiceEngine {
   // ---- recognizer ---------------------------------------------------------
 
   private bindRecognizer() {
-    const M = ExpoSpeechRecognitionModule;
-    this.subs.push(
+    this.unlisten = this.platform.recognizer.listen({
       // Not `speechstart`: each restarted session fires it on noise ~350ms in,
       // which would hold the pending send forever. Only real words hold it.
-      M.addListener('result', (e) => {
-        const raw = e.results[0]?.transcript ?? '';
+      result: (raw, isFinal) => {
         const text = raw.trim();
-        debug('result', e.isFinal ? 'final' : 'partial', JSON.stringify(raw));
+        debug('result', isFinal ? 'final' : 'partial', JSON.stringify(raw));
         if (!text) return;
         this.errorStreak = 0;
-        if (e.isFinal) {
+        if (isFinal) {
           this.lastPartial = '';
           this.pending.push(text);
           this.update({ partial: this.pending.join(' ') });
@@ -177,8 +169,12 @@ export class VoiceSession implements VoiceEngine {
           this.holdSend();
           this.update({ phase: 'hearing', partial: [...this.pending, this.lastPartial].join(' ') });
         }
-      }),
-      M.addListener('end', () => {
+      },
+      speech: () => {
+        this.holdSend();
+        this.update({ phase: 'hearing' });
+      },
+      end: () => {
         debug('end', { lastPartial: this.lastPartial, pending: this.pending, timer: !!this.sendTimer, speech: this.speechQueued });
         this.recognizing = false;
         if (this.lastPartial) {
@@ -189,18 +185,18 @@ export class VoiceSession implements VoiceEngine {
         // whenever a session ends with words pending and no timer, re-arm it.
         if (this.pending.length && !this.sendTimer) this.scheduleSend();
         this.scheduleListen(this.errorStreak ? Math.min(4000, 400 * this.errorStreak) : 50);
-      }),
-      M.addListener('error', (e) => {
-        if (BENIGN_ERRORS.has(e.error)) return;
+      },
+      error: (code, message) => {
+        if (BENIGN_ERRORS.has(code)) return;
         this.errorStreak++;
-        if (e.error === 'not-allowed') {
+        if (code === 'not-allowed') {
           this.update({ phase: 'error', error: 'Microphone permission denied' });
           this.enabled = false;
           return;
         }
-        this.log('system', `Mic: ${e.error} ${e.message ?? ''}`.trim());
-      }),
-    );
+        this.log('system', `Mic: ${code} ${message ?? ''}`.trim());
+      },
+    });
   }
 
   private canListen() {
@@ -211,24 +207,7 @@ export class VoiceSession implements VoiceEngine {
     if (!this.canListen() || this.recognizing) return;
     this.recognizing = true;
     try {
-      ExpoSpeechRecognitionModule.start({
-        lang: this.settings.language,
-        interimResults: true,
-        continuous: false,
-        addsPunctuation: true,
-        maxAlternatives: 1,
-        androidIntentOptions: {
-          EXTRA_PREFER_OFFLINE: true,
-          EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 1800,
-          EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 1200,
-          EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 1000,
-        },
-        iosCategory: {
-          category: 'playAndRecord',
-          categoryOptions: ['defaultToSpeaker', 'allowBluetooth'],
-          mode: 'default',
-        },
-      });
+      this.platform.recognizer.start(this.settings.language);
     } catch {
       this.recognizing = false;
       this.errorStreak++;
@@ -249,7 +228,7 @@ export class VoiceSession implements VoiceEngine {
     if (this.restartTimer) clearTimeout(this.restartTimer);
     if (!this.recognizing) return;
     try {
-      ExpoSpeechRecognitionModule.abort();
+      this.platform.recognizer.abort();
     } catch {}
     this.recognizing = false;
   }
@@ -387,13 +366,7 @@ export class VoiceSession implements VoiceEngine {
           this.scheduleListen(150);
         }
       };
-      Speech.speak(text, {
-        language: this.settings.language,
-        rate: this.settings.rate,
-        onDone: done,
-        onStopped: done,
-        onError: done,
-      });
+      this.platform.speaker.speak(text, { language: this.settings.language, rate: this.settings.rate, onDone: done });
     }
     this.refreshPhase();
   }
@@ -404,7 +377,7 @@ export class VoiceSession implements VoiceEngine {
     if (!this.enabled) return;
     const phase: Phase =
       this.speechQueued > 0 ? 'speaking' : this.turnActive ? 'thinking' : 'listening';
-    if (phase !== this.snapshot.phase) updateKeepAlive(this.title, PHASE_NOTIFICATION[phase]);
+    if (phase !== this.snapshot.phase) this.platform.keepAlive.update(this.title, PHASE_NOTIFICATION[phase]);
     if (phase !== this.snapshot.phase || this.snapshot.error) this.update({ phase, error: null });
   }
 

@@ -10,13 +10,43 @@
 // Agent replies arrive asynchronously (bb turns take minutes), so they come
 // back as session commentary, which GPT-Live speaks in its own words. With
 // Responses delegation every append must use `delegation_id: null`.
+//
+// WebRTC and the SDP exchange come from the platform: the phone posts the offer
+// to OpenAI with the key it holds, the desktop plugin relays it through its
+// server so the key never reaches the page.
 
-import { mediaDevices, RTCPeerConnection, type MediaStream } from 'react-native-webrtc';
 import { BbClient, threadLabel, type BbEvent, type BbThread } from './bb';
-import { setCallAudioRoute, startKeepAlive, stopKeepAlive, updateKeepAlive } from '../modules/bb-voice-native/src';
-import { PHASE_NOTIFICATION, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './voiceSession';
+import { PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
 
-export type LiveSettings = { apiKey: string; model: string; voice: string; delegateModel: string };
+export type LiveSettings = { model: string; voice: string; delegateModel: string };
+
+// The subset of RTCPeerConnection / MediaStream used here; satisfied by both
+// the browser and react-native-webrtc.
+export type PeerConnection = {
+  connectionState: string;
+  addEventListener(type: string, fn: (e: any) => void): void;
+  addTrack(track: any, stream: any): unknown;
+  createDataChannel(label: string): any;
+  createOffer(options?: object): Promise<{ sdp?: string | null }>;
+  setLocalDescription(description: any): Promise<void>;
+  setRemoteDescription(description: any): Promise<void>;
+  close(): void;
+};
+
+export type AudioStream = { getTracks(): { stop(): void }[] };
+
+export type LivePlatform = {
+  createPeerConnection(): PeerConnection;
+  getUserMedia(): Promise<AudioStream>;
+  // Posts the SDP offer and session config to OpenAI; resolves to the answer SDP.
+  negotiate(offerSdp: string, session: LiveSessionConfig): Promise<string>;
+  keepAlive: KeepAlive;
+  setAudioRoute?(active: boolean): void;
+  // Browsers need remote audio attached to an element; returns a detach function.
+  playRemoteAudio?(stream: unknown): () => void;
+};
+
+export type LiveSessionConfig = Record<string, unknown>;
 
 const OPENAI = 'https://api.openai.com/v1';
 const LOG_LIMIT = 60;
@@ -113,6 +143,43 @@ function chunk(text: string, size: number): string[] {
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}…` : text);
 
+export function liveSessionConfig(settings: LiveSettings, context: string): LiveSessionConfig {
+  return {
+    model: settings.model,
+    instructions: voiceInstructions(context),
+    audio: { output: { voice: settings.voice } },
+    delegation: {
+      type: 'responses',
+      responses: {
+        model: settings.delegateModel,
+        instructions: delegateInstructions(context),
+        tools: TOOLS,
+        tool_choice: 'auto',
+      },
+    },
+  };
+}
+
+// The OpenAI half of `LivePlatform.negotiate`, for whichever side holds the key.
+export async function negotiateWithOpenAI(apiKey: string, offerSdp: string, session: LiveSessionConfig): Promise<string> {
+  const res = await fetch(`${OPENAI}/live/sessions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session, transport: { type: 'webrtc', sdp: offerSdp } }),
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    let message = body.slice(0, 300);
+    try {
+      message = JSON.parse(body).error?.message ?? message;
+    } catch {}
+    throw new Error(`GPT-Live ${res.status}: ${message}`);
+  }
+  const json = JSON.parse(body);
+  debug('session', json.session?.id);
+  return json.transport.sdp;
+}
+
 // ---- per-thread bb tracking ------------------------------------------------------
 
 type Tracker = {
@@ -132,9 +199,10 @@ type ToolCall = { call_id: string; name: string; arguments: string };
 export class LiveSession implements VoiceEngine {
   private snapshot: VoiceSnapshot = { phase: 'off', partial: '', log: [], error: null };
   private listeners = new Set<(s: VoiceSnapshot) => void>();
-  private pc: RTCPeerConnection | null = null;
+  private pc: PeerConnection | null = null;
   private dc: any = null;
-  private stream: MediaStream | null = null;
+  private stream: AudioStream | null = null;
+  private detachAudio: (() => void) | null = null;
   private ticker: ReturnType<typeof setInterval> | null = null;
   private enabled = false;
   private started = false;
@@ -153,6 +221,7 @@ export class LiveSession implements VoiceEngine {
   private toolsRunning = false;
 
   constructor(
+    private platform: LivePlatform,
     private client: BbClient,
     private threadId: string,
     private threadTitle: string,
@@ -171,7 +240,7 @@ export class LiveSession implements VoiceEngine {
     this.enabled = true;
     this.update({ phase: 'thinking', error: null, partial: 'Connecting to GPT-Live…' });
     try {
-      await startKeepAlive(this.threadTitle, 'Live voice · connecting');
+      await this.platform.keepAlive.start(this.threadTitle, 'Live voice · connecting');
       await this.track(this.threadId, this.threadTitle);
       const context = await this.buildContext();
       await this.connect(context);
@@ -192,6 +261,8 @@ export class LiveSession implements VoiceEngine {
     this.trackers.clear();
     const { pc, stream, dc } = this;
     this.pc = this.dc = this.stream = null;
+    this.detachAudio?.();
+    this.detachAudio = null;
     // Give session.close a moment to reach OpenAI so billing stops cleanly.
     setTimeout(() => {
       try {
@@ -200,8 +271,8 @@ export class LiveSession implements VoiceEngine {
       stream?.getTracks().forEach((t) => t.stop());
       pc?.close();
     }, 400);
-    setCallAudioRoute(false);
-    stopKeepAlive();
+    this.platform.setAudioRoute?.(false);
+    this.platform.keepAlive.stop();
     this.started = false;
     this.update({ phase: 'off', partial: '' });
   }
@@ -235,22 +306,29 @@ export class LiveSession implements VoiceEngine {
   // ---- connection -------------------------------------------------------------
 
   private async connect(context: string) {
-    const pc = new RTCPeerConnection({ iceServers: [] });
+    const pc = this.platform.createPeerConnection();
     this.pc = pc;
-    (pc as any).addEventListener('connectionstatechange', () => {
+    pc.addEventListener('connectionstatechange', () => {
       debug('pc', pc.connectionState);
       if (this.enabled && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
         this.fail('Voice connection dropped');
       }
     });
+    if (this.platform.playRemoteAudio) {
+      pc.addEventListener('track', (e) => {
+        this.detachAudio?.();
+        this.detachAudio = this.platform.playRemoteAudio!(e.streams?.[0]);
+      });
+    }
 
-    this.stream = (await mediaDevices.getUserMedia({ audio: true, video: false })) as MediaStream;
-    this.stream.getTracks().forEach((track) => pc.addTrack(track, this.stream!));
-    setCallAudioRoute(true);
+    const stream = await this.platform.getUserMedia();
+    this.stream = stream;
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    this.platform.setAudioRoute?.(true);
 
     const dc = pc.createDataChannel('oai-events');
     this.dc = dc;
-    (dc as any).addEventListener('message', (e: any) => {
+    dc.addEventListener('message', (e: any) => {
       try {
         this.onServerEvent(JSON.parse(e.data));
       } catch {}
@@ -258,38 +336,8 @@ export class LiveSession implements VoiceEngine {
 
     const offer = await pc.createOffer({});
     await pc.setLocalDescription(offer);
-    const res = await fetch(`${OPENAI}/live/sessions`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.settings.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session: {
-          model: this.settings.model,
-          instructions: voiceInstructions(context),
-          audio: { output: { voice: this.settings.voice } },
-          delegation: {
-            type: 'responses',
-            responses: {
-              model: this.settings.delegateModel,
-              instructions: delegateInstructions(context),
-              tools: TOOLS,
-              tool_choice: 'auto',
-            },
-          },
-        },
-        transport: { type: 'webrtc', sdp: offer.sdp },
-      }),
-    });
-    const body = await res.text();
-    if (!res.ok) {
-      let message = body.slice(0, 300);
-      try {
-        message = JSON.parse(body).error?.message ?? message;
-      } catch {}
-      throw new Error(`GPT-Live ${res.status}: ${message}`);
-    }
-    const json = JSON.parse(body);
-    debug('session', json.session?.id);
-    await pc.setRemoteDescription({ type: 'answer', sdp: json.transport.sdp } as any);
+    const answer = await this.platform.negotiate(offer.sdp ?? '', liveSessionConfig(this.settings, context));
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
   }
 
   private send(event: Record<string, unknown>) {
@@ -583,7 +631,7 @@ export class LiveSession implements VoiceEngine {
             ? 'thinking'
             : 'listening';
     if (phase !== this.snapshot.phase) {
-      updateKeepAlive(this.threadTitle, `Live · ${PHASE_NOTIFICATION[phase]}`);
+      this.platform.keepAlive.update(this.threadTitle, `Live · ${PHASE_NOTIFICATION[phase]}`);
       this.update({ phase, error: null });
     }
   }

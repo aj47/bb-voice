@@ -6,9 +6,11 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "typecheck": "tsc --noEmit && npm run typecheck -w @aj47/bb-voice-core"
   },
   "dependencies": {
+    "@aj47/bb-voice-core": "*",
     "@config-plugins/react-native-webrtc": "13.0.0",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~54.0.36",
@@ -26,5 +28,8 @@
     "@types/react": "~19.1.0",
     "typescript": "~5.9.2"
   },
-  "private": true
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
 }

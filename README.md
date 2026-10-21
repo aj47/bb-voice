@@ -52,12 +52,18 @@ GPT-Live is billed per second at about $0.05/min while connected, plus a small c
 
 ## How it works
 
-- `App.tsx` loads bb's web UI in a WebView and owns the voice session. The plugin's button talks to it over the WebView bridge (`bbvoice.toggle`, `bbvoice.settings`), and the app sends state back as a `bbvoice:state` event.
-- `src/bb.ts` is a small bb API client: `POST /api/v1/threads/:id/send`, `/ws` change notifications, and `GET /threads/:id/events?afterSeq=N` for agent messages and turn completion.
-- `src/voiceSession.ts` runs on-device mode with `expo-speech-recognition` and `expo-speech`. Recognizer sessions are short and restarted, because segmented sessions misbehave on Samsung. The last partial is kept because Google's on-device recognizer often ends with an empty final.
-- `src/liveSession.ts` runs GPT-Live over WebRTC with Responses delegation. Tool calls run against the bb API. Agent progress is fed back as quiet context and finished replies as spoken commentary.
-- `src/speakable.ts` turns streamed markdown into speakable sentences and skips code blocks.
+The voice engines are shared with the desktop: [`packages/core`](packages/core) is published as `@aj47/bb-voice-core` and also runs inside the [handsfree plugin](https://github.com/aj47/bb-plugins/tree/main/handsfree) on bb's desktop app. Each platform passes adapters for speech, WebRTC and keep-alive.
+
+- `packages/core/src/bb.ts` is a small bb API client: `POST /api/v1/threads/:id/send`, `/ws` change notifications, and `GET /threads/:id/events?afterSeq=N` for agent messages and turn completion.
+- `packages/core/src/classicSession.ts` runs on-device mode against a `Recognizer` and `Speaker`. Recognizer sessions are short and restarted, because segmented sessions misbehave on Samsung. The last partial is kept because Google's on-device recognizer often ends with an empty final.
+- `packages/core/src/liveSession.ts` runs GPT-Live over WebRTC with Responses delegation. Tool calls run against the bb API. Agent progress is fed back as quiet context and finished replies as spoken commentary.
+- `packages/core/src/speakable.ts` turns streamed markdown into speakable sentences and skips code blocks.
+- `packages/core/src/bridge.ts` is the WebView protocol shared with the plugin (`bbvoice.toggle`, `bbvoice.settings`, `bbvoice:state`).
+- `src/platform.ts` adapts `expo-speech-recognition`, `expo-speech`, `react-native-webrtc` and the native keep-alive to the core.
+- `App.tsx` loads bb's web UI in a WebView and owns the voice session, the voice bar and the settings sheet.
 - `modules/bb-voice-native` is an Android foreground service (microphone type) with a wake lock, plus a HeadlessJS task so React Native timers keep running with the screen off. It also routes call audio to a headset or the speaker.
+
+Metro reads the core's TypeScript source through the npm workspace, so the app needs no build step for it. Publish a new core version (`npm publish -w @aj47/bb-voice-core`) when the plugin needs a change.
 
 iOS should mostly work for on-device mode, but it is untested and has no background support yet.
 
