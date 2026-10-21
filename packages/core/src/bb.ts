@@ -82,6 +82,15 @@ export class BbClient {
     return this.json<{ id: string; name: string }[]>(`/projects`);
   }
 
+  // The project for a new thread when none is chosen: the most recently active one.
+  async defaultProjectId(): Promise<string> {
+    const [latest] = await this.listThreads();
+    if (latest) return latest.projectId;
+    const [project] = await this.listProjects();
+    if (!project) throw new Error('No bb project to start a thread in');
+    return project.id;
+  }
+
   createThread(projectId: string, text: string) {
     return this.json<BbThread>(`/threads`, {
       method: 'POST',

@@ -32,8 +32,14 @@ import { classicPlatform, livePlatform } from './src/platform';
 import { DEFAULT_APP_SETTINGS, getApiKey, loadSettings, saveSettings, type AppSettings } from './src/settings';
 
 const KEY_SERVER = 'bbvoice.server';
+// An unreachable host (e.g. Tailscale down) can hang without ever firing onError.
+const LOAD_TIMEOUT_MS = 15000;
 
-type Active = { threadId: string; title: string; mode: VoiceMode; session: VoiceEngine };
+// A thread to talk to, or a new thread (started by the first message) in a project.
+type Target = { threadId: string } | { threadId: null; projectId: string | null };
+type Active = { threadId: string | null; title: string; mode: VoiceMode; session: VoiceEngine };
+
+const NEW_THREAD_TITLE = 'New thread';
 
 export default function App() {
   const [server, setServer] = useState<string | null>(null);
@@ -102,11 +108,22 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   const [loadError, setLoadError] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
-  const pendingThread = useRef<string | null>(null);
+  const pendingTarget = useRef<Target | null>(null);
+  const loaded = useRef(false);
 
   useEffect(() => {
     loadSettings().then(setSettings);
   }, []);
+
+  // The WebView remounts whenever the error screen is dismissed, so restart the timer then too.
+  useEffect(() => {
+    if (loadError) return;
+    loaded.current = false;
+    const timer = setTimeout(() => {
+      if (!loaded.current) setLoadError(`Couldn't reach ${server} (timed out). Is it running and reachable from this phone?`);
+    }, LOAD_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [loadError, server]);
 
   // Push the voice state into the page so the plugin button reflects it.
   const publish = useCallback((phase: Phase) => {
@@ -129,18 +146,22 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   }, [publish]);
 
   const start = useCallback(
-    async (threadId: string) => {
+    async (target: Target) => {
       stop();
-      let title = threadId;
-      try {
-        title = threadLabel(await client.getThread(threadId));
-      } catch {}
+      const { threadId } = target;
+      const projectId = 'projectId' in target ? target.projectId : null;
+      let title = threadId ?? NEW_THREAD_TITLE;
+      if (threadId) {
+        try {
+          title = threadLabel(await client.getThread(threadId));
+        } catch {}
+      }
       const current = await loadSettings();
       let session: VoiceEngine;
       if (current.mode === 'live') {
         const apiKey = await getApiKey();
         if (!apiKey) {
-          pendingThread.current = threadId;
+          pendingTarget.current = target;
           setShowSettings(true);
           return;
         }
@@ -157,9 +178,18 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
             setActiveTitle(nextTitle);
             publish(snapRef.current?.phase ?? 'listening');
           },
+          projectId,
         );
       } else {
-        session = new ClassicSession(classicPlatform, client, threadId, DEFAULT_SETTINGS, title);
+        session = new ClassicSession(classicPlatform, client, threadId, DEFAULT_SETTINGS, title, {
+          projectId,
+          onThreadChange: (nextId, nextTitle) => {
+            if (active.current?.session !== session) return;
+            active.current = { ...active.current, threadId: nextId, title: nextTitle };
+            setActiveTitle(nextTitle);
+            publish(snapRef.current?.phase ?? 'thinking');
+          },
+        });
       }
       active.current = { threadId, title, mode: current.mode, session };
       setActiveTitle(title);
@@ -174,9 +204,9 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   );
 
   const toggle = useCallback(
-    (threadId: string) => {
-      if (active.current?.threadId === threadId) stop();
-      else start(threadId);
+    (target: Target) => {
+      if (active.current && active.current.threadId === target.threadId) stop();
+      else start(target);
     },
     [start, stop],
   );
@@ -203,7 +233,8 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   const onMessage = useCallback(
     (e: WebViewMessageEvent) => {
       const msg = parseBridgeMessage(e.nativeEvent.data);
-      if (msg?.type === 'bbvoice.toggle') toggle(msg.threadId);
+      if (msg?.type === 'bbvoice.toggle') toggle({ threadId: msg.threadId });
+      if (msg?.type === 'bbvoice.newThread') toggle({ threadId: null, projectId: msg.projectId });
       if (msg?.type === 'bbvoice.settings') setShowSettings(true);
     },
     [toggle],
@@ -228,7 +259,10 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
         style={styles.flex}
         injectedJavaScriptBeforeContentLoaded={BRIDGE_BOOT}
         onMessage={onMessage}
-        onLoadEnd={() => publish(phase)}
+        onLoadEnd={() => {
+          loaded.current = true;
+          publish(phase);
+        }}
         onNavigationStateChange={(nav) => {
           canGoBack.current = nav.canGoBack;
         }}
@@ -259,15 +293,15 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
         settings={settings}
         onClose={() => {
           setShowSettings(false);
-          pendingThread.current = null;
+          pendingTarget.current = null;
         }}
         onSave={async (next, apiKey) => {
           await saveSettings(next, apiKey);
           setSettings(await loadSettings());
           setShowSettings(false);
-          const threadId = pendingThread.current;
-          pendingThread.current = null;
-          if (threadId) start(threadId);
+          const target = pendingTarget.current;
+          pendingTarget.current = null;
+          if (target) start(target);
         }}
       />
     </View>

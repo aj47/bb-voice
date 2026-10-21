@@ -223,10 +223,13 @@ export class LiveSession implements VoiceEngine {
   constructor(
     private platform: LivePlatform,
     private client: BbClient,
-    private threadId: string,
+    // null: no thread yet; the first request starts one with new_thread.
+    private threadId: string | null,
     private threadTitle: string,
     private settings: LiveSettings,
     private onThreadChange: (threadId: string, title: string) => void = () => {},
+    // Where new_thread puts a thread when there is no current one (null: the most recently active project).
+    private projectId: string | null = null,
   ) {}
 
   subscribe(fn: (s: VoiceSnapshot) => void) {
@@ -241,7 +244,7 @@ export class LiveSession implements VoiceEngine {
     this.update({ phase: 'thinking', error: null, partial: 'Connecting to GPT-Live…' });
     try {
       await this.platform.keepAlive.start(this.threadTitle, 'Live voice · connecting');
-      await this.track(this.threadId, this.threadTitle);
+      if (this.threadId) await this.track(this.threadId, this.threadTitle);
       const context = await this.buildContext();
       await this.connect(context);
       this.ticker = setInterval(() => this.tick(), 300);
@@ -286,14 +289,19 @@ export class LiveSession implements VoiceEngine {
   // ---- context ----------------------------------------------------------------
 
   private async buildContext(): Promise<string> {
-    const lines: string[] = [`Current thread: "${this.threadTitle}" (${this.threadId}).`];
-    try {
-      const recent = await this.client.recentAgentMessages(this.threadId, 3);
-      if (recent.length) {
-        lines.push('Its latest agent messages, oldest first:');
-        for (const m of recent) lines.push(`- ${clip(m.replace(/\s+/g, ' '), 700)}`);
-      }
-    } catch {}
+    const lines: string[] = [];
+    if (this.threadId) {
+      lines.push(`Current thread: "${this.threadTitle}" (${this.threadId}).`);
+      try {
+        const recent = await this.client.recentAgentMessages(this.threadId, 3);
+        if (recent.length) {
+          lines.push('Its latest agent messages, oldest first:');
+          for (const m of recent) lines.push(`- ${clip(m.replace(/\s+/g, ' '), 700)}`);
+        }
+      } catch {}
+    } else {
+      lines.push('No current thread: the user opened this session to start a new one. Use new_thread for their first request unless they name an existing thread.');
+    }
     try {
       const [threads, projects] = await Promise.all([this.client.listThreads(12), this.client.listProjects()]);
       const names = new Map(projects.map((p) => [p.id, p.name]));
@@ -441,7 +449,9 @@ export class LiveSession implements VoiceEngine {
   // ---- tools ------------------------------------------------------------------
 
   private target(args: any): string {
-    return typeof args?.thread_id === 'string' && args.thread_id.startsWith('thr_') ? args.thread_id : this.threadId;
+    if (typeof args?.thread_id === 'string' && args.thread_id.startsWith('thr_')) return args.thread_id;
+    if (!this.threadId) throw new Error('No current thread yet; use new_thread, or pass thread_id');
+    return this.threadId;
   }
 
   private async runTool(name: string, args: any): Promise<unknown> {
@@ -522,7 +532,8 @@ export class LiveSession implements VoiceEngine {
       const hit = projects.find((p) => p.id === project || p.name.toLowerCase() === wanted) ?? projects.find((p) => p.name.toLowerCase().includes(wanted));
       if (hit) return hit.id;
     }
-    return (await this.client.getThread(this.threadId)).projectId;
+    if (this.threadId) return (await this.client.getThread(this.threadId)).projectId;
+    return this.projectId ?? (await this.client.defaultProjectId());
   }
 
   private async setCurrent(thread: BbThread) {

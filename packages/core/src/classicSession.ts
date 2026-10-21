@@ -8,7 +8,7 @@
 //   any new speech holds the pending send.
 // - Half duplex: stop the mic while TTS plays so the agent never hears itself.
 
-import { BbClient, type BbEvent } from './bb';
+import { BbClient, threadLabel, type BbEvent } from './bb';
 import { SentenceChunker } from './speakable';
 import { PHASE_NOTIFICATION, type KeepAlive, type LogEntry, type Phase, type VoiceEngine, type VoiceSnapshot } from './types';
 
@@ -41,6 +41,13 @@ export interface Speaker {
 }
 
 export type ClassicPlatform = { recognizer: Recognizer; speaker: Speaker; keepAlive: KeepAlive };
+
+// A session with no thread yet: the first utterance starts one in `projectId`
+// (null: the most recently active project) and the session follows it.
+export type NewThreadOptions = {
+  projectId?: string | null;
+  onThreadChange?: (threadId: string, title: string) => void;
+};
 
 const LOG_LIMIT = 60;
 const debug = (...args: unknown[]) => console.log('[bbvoice]', ...args);
@@ -80,9 +87,10 @@ export class ClassicSession implements VoiceEngine {
   constructor(
     private platform: ClassicPlatform,
     private client: BbClient,
-    private threadId: string,
+    private threadId: string | null,
     private settings: VoiceSettings,
     private title: string,
+    private options: NewThreadOptions = {},
   ) {}
 
   subscribe(fn: (s: VoiceSnapshot) => void) {
@@ -102,14 +110,17 @@ export class ClassicSession implements VoiceEngine {
     await this.platform.keepAlive.start(this.title, 'Listening');
     this.bindRecognizer();
 
-    try {
-      this.lastSeq = await this.client.latestSeq(this.threadId);
-      const thread = await this.client.getThread(this.threadId);
-      this.turnActive = thread.status === 'active';
-    } catch (e: any) {
-      this.update({ phase: 'error', error: `Can't reach bb: ${e.message}` });
+    if (this.threadId) {
+      const threadId = this.threadId;
+      try {
+        this.lastSeq = await this.client.latestSeq(threadId);
+        const thread = await this.client.getThread(threadId);
+        this.turnActive = thread.status === 'active';
+      } catch (e: any) {
+        this.update({ phase: 'error', error: `Can't reach bb: ${e.message}` });
+      }
+      this.unwatch = this.client.watchThread(threadId, () => this.sync());
     }
-    this.unwatch = this.client.watchThread(this.threadId, () => this.sync());
     this.refreshPhase();
     this.listen();
   }
@@ -259,7 +270,7 @@ export class ClassicSession implements VoiceEngine {
     const normalized = text.toLowerCase().replace(/[^a-z ]/g, '').trim();
     if (STOP_WORDS.has(normalized)) {
       this.log('you', text);
-      if (this.turnActive) {
+      if (this.turnActive && this.threadId) {
         this.client.stop(this.threadId).catch((e) => this.log('system', `Stop failed: ${e.message}`));
       }
       return this.refreshPhase();
@@ -269,6 +280,7 @@ export class ClassicSession implements VoiceEngine {
     this.muted = false;
     this.turnActive = true;
     this.refreshPhase();
+    if (!this.threadId) return this.startThread(text);
     try {
       const res = await this.client.send(this.threadId, text);
       debug('sent', res.delivery);
@@ -277,6 +289,24 @@ export class ClassicSession implements VoiceEngine {
       this.turnActive = false;
       debug('send failed', e.message);
       this.log('system', `Send failed: ${e.message}`);
+      this.refreshPhase();
+    }
+  }
+
+  private async startThread(text: string) {
+    try {
+      const projectId = this.options.projectId ?? (await this.client.defaultProjectId());
+      const thread = await this.client.createThread(projectId, text);
+      if (!this.enabled) return;
+      this.threadId = thread.id;
+      this.title = threadLabel(thread);
+      this.lastSeq = 0;
+      this.unwatch = this.client.watchThread(thread.id, () => this.sync());
+      this.log('system', `Started "${this.title}"`);
+      this.options.onThreadChange?.(thread.id, this.title);
+    } catch (e: any) {
+      this.turnActive = false;
+      this.log('system', `Couldn't start a thread: ${e.message}`);
       this.refreshPhase();
     }
   }
@@ -292,7 +322,7 @@ export class ClassicSession implements VoiceEngine {
       do {
         this.resync = false;
         try {
-          const events = await this.client.eventsAfter(this.threadId, this.lastSeq);
+          const events = this.threadId ? await this.client.eventsAfter(this.threadId, this.lastSeq) : [];
           for (const ev of events) this.apply(ev);
         } catch (e: any) {
           this.log('system', `Sync failed: ${e.message}`);
