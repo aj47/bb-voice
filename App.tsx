@@ -19,8 +19,11 @@ import {
   LIVE_VOICES,
   LiveSession,
   parseBridgeMessage,
+  parseThreadModel,
   STATE_EVENT,
+  statusDetail,
   threadLabel,
+  type BbModel,
   type BridgeState,
   type Phase,
   type VoiceEngine,
@@ -178,7 +181,7 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
           client,
           threadId,
           title,
-          { model: current.liveModel, voice: current.liveVoice, delegateModel: current.delegateModel },
+          { model: current.liveModel, voice: current.liveVoice, delegateModel: current.delegateModel, threadModel: current.threadModel },
           // The voice can move itself to another thread (switch_thread / new_thread).
           (nextId, nextTitle) => {
             if (active.current?.session !== session) return;
@@ -191,6 +194,7 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
       } else {
         session = new ClassicSession(classicPlatform, client, threadId, DEFAULT_SETTINGS, title, {
           projectId,
+          execution: parseThreadModel(current.threadModel),
           onThreadChange: (nextId, nextTitle) => {
             if (active.current?.session !== session) return;
             active.current = { ...active.current, threadId: nextId, title: nextTitle };
@@ -201,8 +205,12 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
       }
       active.current = { threadId, title, mode: current.mode, session };
       setActiveTitle(title);
+      let running = false;
       session.subscribe((s) => {
         if (active.current?.session !== session) return;
+        // Back to off after running: the session hung itself up (end_call).
+        if (s.phase === 'off' && running) return stop();
+        running ||= s.phase !== 'off';
         setSnap(s);
         publish(s.phase);
       });
@@ -286,8 +294,7 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
         <VoiceBar
           title={activeTitle}
           phase={phase}
-          partial={snap.partial}
-          error={snap.error}
+          detail={statusDetail(snap)}
           micMuted={snap.micMuted}
           onToggleMic={() => active.current?.session.setMicMuted(!snap.micMuted)}
           onPress={() => {
@@ -299,6 +306,7 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
         />
       ) : null}
       <SettingsSheet
+        client={client}
         visible={showSettings}
         settings={settings}
         onClose={() => {
@@ -318,12 +326,22 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
   );
 }
 
-function Dropdown({ value, options, onChange }: { value: string; options: string[]; onChange: (v: string) => void }) {
+function Dropdown({
+  value,
+  options,
+  onChange,
+  labels,
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+  labels?: Record<string, string>;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <View>
       <Pressable style={[styles.input, styles.dropdown]} onPress={() => setOpen((o) => !o)}>
-        <Text style={styles.dropdownText}>{value}</Text>
+        <Text style={styles.dropdownText}>{labels?.[value] ?? value}</Text>
         <Text style={styles.dropdownText}>{open ? '▴' : '▾'}</Text>
       </Pressable>
       {open ? (
@@ -337,7 +355,7 @@ function Dropdown({ value, options, onChange }: { value: string; options: string
                 setOpen(false);
               }}
             >
-              <Text style={styles.dropdownText}>{option}</Text>
+              <Text style={styles.dropdownText}>{labels?.[option] ?? option}</Text>
             </Pressable>
           ))}
         </ScrollView>
@@ -346,7 +364,25 @@ function Dropdown({ value, options, onChange }: { value: string; options: string
   );
 }
 
+const PROJECT_DEFAULT = '';
+
+// Options for the new-thread model: bb's own catalog, as "providerId:model".
+function useThreadModels(client: BbClient, visible: boolean, current: string) {
+  const [models, setModels] = useState<BbModel[]>([]);
+  useEffect(() => {
+    if (visible) client.listModels().then(setModels, () => setModels([]));
+  }, [client, visible]);
+  return useMemo(() => {
+    const labels: Record<string, string> = { [PROJECT_DEFAULT]: 'Project default' };
+    for (const m of models) labels[`${m.providerId}:${m.model}`] = `${m.displayName} · ${m.providerName}`;
+    // Keep a saved choice selectable even if its provider is offline right now.
+    if (current && !labels[current]) labels[current] = current;
+    return { options: Object.keys(labels), labels };
+  }, [models, current]);
+}
+
 function SettingsSheet(props: {
+  client: BbClient;
   visible: boolean;
   settings: AppSettings;
   onClose: () => void;
@@ -356,7 +392,9 @@ function SettingsSheet(props: {
   const [model, setModel] = useState(props.settings.liveModel);
   const [voice, setVoice] = useState(props.settings.liveVoice);
   const [delegateModel, setDelegateModel] = useState(props.settings.delegateModel);
+  const [threadModel, setThreadModel] = useState(props.settings.threadModel);
   const [key, setKey] = useState('');
+  const threadModels = useThreadModels(props.client, props.visible, threadModel);
 
   useEffect(() => {
     if (!props.visible) return;
@@ -364,6 +402,7 @@ function SettingsSheet(props: {
     setModel(props.settings.liveModel);
     setVoice(props.settings.liveVoice);
     setDelegateModel(props.settings.delegateModel);
+    setThreadModel(props.settings.threadModel);
     setKey('');
   }, [props.visible, props.settings]);
 
@@ -405,6 +444,8 @@ function SettingsSheet(props: {
             <Dropdown value={voice} options={LIVE_VOICES} onChange={setVoice} />
           </>
         ) : null}
+        <Text style={styles.label}>New thread model (when you don't name one)</Text>
+        <Dropdown value={threadModel} options={threadModels.options} labels={threadModels.labels} onChange={setThreadModel} />
         <Pressable
           style={styles.button}
           onPress={() =>
@@ -414,6 +455,7 @@ function SettingsSheet(props: {
                 liveModel: model.trim() || DEFAULT_APP_SETTINGS.liveModel,
                 liveVoice: voice.trim() || DEFAULT_APP_SETTINGS.liveVoice,
                 delegateModel: delegateModel.trim() || DEFAULT_APP_SETTINGS.delegateModel,
+                threadModel,
               },
               key.trim() ? key.trim() : undefined,
             )
@@ -431,6 +473,7 @@ const PHASE_LABEL: Record<Phase, string> = {
   listening: 'Listening',
   hearing: 'Hearing you',
   thinking: 'Agent working',
+  asking: 'Agent has a question',
   speaking: 'Speaking · tap to interrupt',
   error: 'Error · tap to retry',
 };
@@ -443,6 +486,7 @@ const PHASE_COLOR: Record<Phase, string> = {
   listening: '#1f7a4d',
   hearing: '#27a265',
   thinking: '#7a5a1f',
+  asking: '#5b3f8c',
   speaking: '#1f4f7a',
   error: '#7a1f1f',
 };
@@ -450,8 +494,8 @@ const PHASE_COLOR: Record<Phase, string> = {
 function VoiceBar(props: {
   title: string;
   phase: Phase;
-  partial: string;
-  error: string | null;
+  // Error, the open question, or what was heard (statusDetail).
+  detail: string;
   micMuted: boolean;
   onToggleMic: () => void;
   onPress: () => void;
@@ -466,9 +510,9 @@ function VoiceBar(props: {
         <Text style={styles.barPhase} numberOfLines={1}>
           {label} · {props.title}
         </Text>
-        {props.error || props.partial ? (
-          <Text style={styles.barSub} numberOfLines={2}>
-            {props.error ?? props.partial}
+        {props.detail ? (
+          <Text style={styles.barSub} numberOfLines={props.phase === 'asking' ? 4 : 2}>
+            {props.detail}
           </Text>
         ) : null}
       </Pressable>

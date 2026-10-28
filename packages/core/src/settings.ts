@@ -8,6 +8,8 @@ export type VoicePrefs = {
   liveModel: string;
   liveVoice: string;
   delegateModel: string;
+  // Agent for threads the voice starts: "providerId:model", or "" for the project default.
+  threadModel: string;
 };
 
 export const DEFAULT_PREFS: VoicePrefs = {
@@ -15,6 +17,7 @@ export const DEFAULT_PREFS: VoicePrefs = {
   liveModel: 'gpt-live-1',
   liveVoice: 'marin',
   delegateModel: 'gpt-6-luna',
+  threadModel: '',
 };
 
 // GPT-Live voices from OpenAI's docs; marin and cedar are the recommended defaults.

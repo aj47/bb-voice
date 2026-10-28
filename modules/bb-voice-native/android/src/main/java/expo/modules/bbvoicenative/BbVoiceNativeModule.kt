@@ -4,7 +4,10 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.UiThreadUtil
@@ -63,6 +66,27 @@ class BbVoiceNativeModule : Module() {
         if (tasks.isTaskRunning(id)) tasks.finishTask(id)
       }
       true
+    }
+
+    // Battery optimization ("Optimized" on Samsung) still holds JS timers while
+    // locked, even with the foreground service. Exempt is "Unrestricted".
+    Function("isIgnoringBatteryOptimizations") {
+      val context = appContext.reactContext ?: return@Function true
+      val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+      pm.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
+    // Shows the system "Let app always run in background?" dialog.
+    Function("requestIgnoreBatteryOptimizations") {
+      val context = appContext.reactContext ?: return@Function false
+      val ask = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
+      try {
+        val activity = appContext.currentActivity
+        if (activity != null) activity.startActivity(ask) else context.startActivity(ask.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+      } catch (e: Exception) {
+        false
+      }
     }
 
     // WebRTC plays through the earpiece by default. Route the call to a headset
