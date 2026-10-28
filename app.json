@@ -2,7 +2,7 @@
   "expo": {
     "name": "bb voice",
     "slug": "bb-voice",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -20,7 +20,7 @@
           "audio"
         ]
       },
-      "buildNumber": "2"
+      "buildNumber": "3"
     },
     "android": {
       "package": "net.techfren.bbvoice",
@@ -34,7 +34,7 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.WAKE_LOCK"
       ],
-      "versionCode": 2
+      "versionCode": 3
     },
     "web": {
       "favicon": "./assets/favicon.png"
