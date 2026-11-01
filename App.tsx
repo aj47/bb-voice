@@ -9,7 +9,7 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, BackHandler, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AppState, BackHandler, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 import {
   BbClient,
@@ -36,6 +36,26 @@ import { classicPlatform, livePlatform } from './src/platform';
 import { DEFAULT_APP_SETTINGS, getApiKey, loadSettings, saveSettings, type AppSettings } from './src/settings';
 
 const KEY_SERVER = 'bbvoice.server';
+
+function originOf(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+// Keep the bb UI in the WebView; hand links to other sites to the phone's
+// browser. Loading them in place would replace bb, and Android blocks http://
+// pages outright (ERR_CLEARTEXT_NOT_PERMITTED).
+function shouldLoadInWebView(server: string, url: string, isTopFrame?: boolean): boolean {
+  if (isTopFrame === false) return true;
+  if (/^(about|blob|data):/i.test(url)) return true;
+  const target = originOf(url);
+  if (target !== null && target === originOf(server)) return true;
+  Linking.openURL(url).catch(() => {});
+  return false;
+}
 // An unreachable host (e.g. Tailscale down) can hang without ever firing onError.
 const LOAD_TIMEOUT_MS = 15000;
 
@@ -279,6 +299,9 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
           loaded.current = true;
           publish(phase);
         }}
+        onShouldStartLoadWithRequest={(req) =>
+          shouldLoadInWebView(server, req.url, req.isTopFrame)
+        }
         onNavigationStateChange={(nav) => {
           canGoBack.current = nav.canGoBack;
         }}
