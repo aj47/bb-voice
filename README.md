@@ -58,7 +58,7 @@ The voice engines are shared with the desktop: [`packages/core`](packages/core) 
 - `packages/core/src/classicSession.ts` runs on-device mode against a `Recognizer` and `Speaker`. Recognizer sessions are short and restarted, because segmented sessions misbehave on Samsung. The last partial is kept because Google's on-device recognizer often ends with an empty final.
 - `packages/core/src/liveSession.ts` runs GPT-Live over WebRTC with Responses delegation. Tool calls run against the bb API. Agent progress is fed back as quiet context and finished replies as spoken commentary.
 - `packages/core/src/speakable.ts` turns streamed markdown into speakable sentences and skips code blocks.
-- `packages/core/src/bridge.ts` is the WebView protocol shared with the plugin (`bbvoice.toggle`, `bbvoice.settings`, `bbvoice:state`).
+- `packages/core/src/bridge.ts` is the WebView protocol shared with the plugin (`bbvoice.toggle`, `bbvoice.settings`, `bbvoice:state`), plus `bbvoice.speak` and `bbvoice:speech`, which give the read-aloud plugin native speech because Android WebViews have no `speechSynthesis`.
 - `src/platform.ts` adapts `expo-speech-recognition`, `expo-speech`, `react-native-webrtc` and the native keep-alive to the core.
 - `App.tsx` loads bb's web UI in a WebView and owns the voice session, the voice bar and the settings sheet.
 - `modules/bb-voice-native` is an Android foreground service (microphone type) with a wake lock, plus a HeadlessJS task so React Native timers keep running with the screen off. It also routes call audio to a headset or the speaker.
