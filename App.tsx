@@ -3,10 +3,13 @@
 //
 // The `handsfree` bb plugin adds a realtime button to each thread composer. It talks
 // to this shell over the WebView bridge: the page posts `bbvoice.toggle`, the
-// shell answers by dispatching `bbvoice:state` into the page.
+// shell answers by dispatching `bbvoice:state` into the page. The `read-aloud` plugin
+// posts `bbvoice.speak` and the shell speaks it natively, since the WebView has no
+// speechSynthesis, then dispatches `bbvoice:speech` when each utterance ends.
 
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Speech from 'expo-speech';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState, BackHandler, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
@@ -20,6 +23,7 @@ import {
   LiveSession,
   parseBridgeMessage,
   parseThreadModel,
+  SPEECH_EVENT,
   STATE_EVENT,
   statusDetail,
   threadLabel,
@@ -272,6 +276,17 @@ function Shell({ server, onChangeServer }: { server: string; onChangeServer: (ur
       if (msg?.type === 'bbvoice.toggle') toggle({ threadId: msg.threadId });
       if (msg?.type === 'bbvoice.newThread') toggle({ threadId: null, projectId: msg.projectId });
       if (msg?.type === 'bbvoice.settings') setShowSettings(true);
+      if (msg?.type === 'bbvoice.speak') {
+        const done = () =>
+          web.current?.injectJavaScript(`
+            window.dispatchEvent(new CustomEvent('${SPEECH_EVENT}', { detail: { id: ${JSON.stringify(msg.id)} } }));
+            true;
+          `);
+        // A hands-free session owns the speaker and the mic; don't talk over it.
+        if (active.current) done();
+        else Speech.speak(msg.text, { rate: msg.rate, onDone: done, onStopped: done, onError: done });
+      }
+      if (msg?.type === 'bbvoice.speakStop' && !active.current) Speech.stop();
     },
     [toggle],
   );
